@@ -75,8 +75,9 @@ def detect_signals(
                 recovery_date = date
 
         elif state == "RECOVERED":
-            days_since_first = (date - first_dip_date).days
-            if days_since_first > max_days:
+            # 4-week window counted from recovery date (not first dip)
+            days_since_recovery = (date - recovery_date).days
+            if days_since_recovery > max_days:
                 if d_val < low_thresh:
                     state = "FIRST_DIP"
                     first_dip_date = date
