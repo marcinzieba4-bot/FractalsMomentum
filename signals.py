@@ -1,13 +1,17 @@
 """
-Fractal Buy Signal Detection + Forward Return Analysis
-=======================================================
-Buy signal logic:
-  1. D drops below LOW_THRESH  (< 1.30)  — first dip
-  2. D recovers above HIGH_THRESH (> 1.37) — recovery
-  3. D drops below LOW_THRESH again (< 1.30) — second dip
+Fractal Signal Detection + Forward Return Analysis
+===================================================
+Signal logic:
+  1. D drops below LOW_THRESH  (< 1.30)  — first dip  (strong trend)
+  2. D recovers above HIGH_THRESH (> 1.37) — market pauses
+  3. D drops below LOW_THRESH again (< 1.30) — trend resumes
      within MAX_WEEKS_BETWEEN weeks of the first dip
 
-Signal date = day the second dip is confirmed (D < 1.30 after recovery).
+Trend direction is determined by R (n-period log return) at the first dip:
+  R > 0  → bullish trend  → BUY  signal (returning to uptrend)
+  R < 0  → bearish trend  → SELL signal (returning to downtrend)
+
+Signal date = day the second dip is confirmed.
 Forward returns measured at close 2, 4, 6, 8, 12 weeks later.
 """
 
@@ -46,9 +50,8 @@ def detect_signals(
         RECOVERED   → D recovered above high_thresh; now wait for second dip (within max_weeks)
 
     Returns a DataFrame of signal dates with columns:
-        signal_date, close_at_signal,
-        first_dip_date, recovery_date,
-        D_at_signal
+        signal_date, signal, close_at_signal, D_at_signal,
+        R_at_first_dip, first_dip_date, recovery_date
     """
     max_days = max_weeks * 7   # calendar-day window (generous for trading days)
 
@@ -58,6 +61,7 @@ def detect_signals(
     recovery_date  = None
 
     D = df["D"]
+    R = df["R"]   # n-period log return — encodes trend direction
 
     for date, d_val in D.items():
         if state == "IDLE":
@@ -69,14 +73,10 @@ def detect_signals(
             if d_val >= high_thresh:
                 state = "RECOVERED"
                 recovery_date = date
-            # if D never recovers that's fine — stay in FIRST_DIP
-            # but reset if we've been here too long without recovery
-            # (no cap on recovery wait — only the second dip must arrive within max_weeks of first)
 
         elif state == "RECOVERED":
             days_since_first = (date - first_dip_date).days
             if days_since_first > max_days:
-                # window expired — if D is still low restart from here
                 if d_val < low_thresh:
                     state = "FIRST_DIP"
                     first_dip_date = date
@@ -86,15 +86,19 @@ def detect_signals(
                     first_dip_date = None
                     recovery_date  = None
             elif d_val < low_thresh:
-                # SIGNAL FIRED
+                # Determine trend direction from R at first dip date
+                r_at_dip = R.loc[first_dip_date]
+                direction = "BUY" if r_at_dip > 0 else "SELL"
+
                 signals.append({
-                    "signal_date":    date,
+                    "signal_date":     date,
+                    "signal":          direction,
                     "close_at_signal": df.loc[date, "close"],
-                    "D_at_signal":    d_val,
-                    "first_dip_date": first_dip_date,
-                    "recovery_date":  recovery_date,
+                    "D_at_signal":     d_val,
+                    "R_at_first_dip":  r_at_dip,
+                    "first_dip_date":  first_dip_date,
+                    "recovery_date":   recovery_date,
                 })
-                # reset — don't allow overlapping signals, restart from IDLE
                 state = "IDLE"
                 first_dip_date = None
                 recovery_date  = None
@@ -145,17 +149,18 @@ def add_forward_returns(
 
 def print_signal_table(signals: pd.DataFrame, forward_weeks: list = FORWARD_WEEKS) -> None:
     ret_cols = [f"ret_{w}w" for w in forward_weeks]
-    display_cols = ["first_dip_date", "recovery_date", "D_at_signal",
-                    "close_at_signal"] + ret_cols
+    display_cols = ["signal", "first_dip_date", "recovery_date",
+                    "R_at_first_dip", "D_at_signal", "close_at_signal"] + ret_cols
 
-    print("\n" + "=" * 95)
-    print("  FRACTAL BUY SIGNALS  (D<1.30 → D>1.37 → D<1.30 within 4 weeks)")
-    print("=" * 95)
+    print("\n" + "=" * 110)
+    print("  FRACTAL SIGNALS  (D<1.30 → D>1.37 → D<1.30 within 4 weeks)  |  R>0 → BUY, R<0 → SELL")
+    print("=" * 110)
 
     df = signals[display_cols].copy()
-    df["first_dip_date"] = df["first_dip_date"].dt.date
-    df["recovery_date"]  = df["recovery_date"].dt.date
-    df["D_at_signal"]    = df["D_at_signal"].map("{:.4f}".format)
+    df["first_dip_date"]  = df["first_dip_date"].dt.date
+    df["recovery_date"]   = df["recovery_date"].dt.date
+    df["R_at_first_dip"]  = df["R_at_first_dip"].map("{:+.3f}".format)
+    df["D_at_signal"]     = df["D_at_signal"].map("{:.4f}".format)
     df["close_at_signal"] = df["close_at_signal"].map("${:.2f}".format)
 
     for col in ret_cols:
@@ -166,21 +171,24 @@ def print_signal_table(signals: pd.DataFrame, forward_weeks: list = FORWARD_WEEK
     print(df.to_string())
     print()
 
-    # Summary stats for completed signals
-    completed = signals[ret_cols].dropna()
-    if len(completed):
-        print(f"  Summary  ({len(completed)} completed signals)")
-        print("-" * 60)
+    # Summary split by BUY / SELL
+    for direction in ["BUY", "SELL"]:
+        subset = signals[signals["signal"] == direction][ret_cols].dropna()
+        if subset.empty:
+            continue
+        print(f"  {direction} signals — summary  ({len(subset)} completed)")
+        print("-" * 65)
         summary = pd.DataFrame({
-            "mean":    completed.mean(),
-            "median":  completed.median(),
-            "win%":    (completed > 0).mean() * 100,
-            "min":     completed.min(),
-            "max":     completed.max(),
+            "mean":   subset.mean(),
+            "median": subset.median(),
+            "win%":   (subset > 0).mean() * 100,
+            "min":    subset.min(),
+            "max":    subset.max(),
         })
         summary.index = [c.replace("ret_", "").replace("w", " weeks") for c in summary.index]
         print(summary.to_string(float_format=lambda x: f"{x:+.1f}"))
-    print("=" * 95 + "\n")
+        print()
+    print("=" * 110 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -198,20 +206,26 @@ def plot_signals(
         gridspec_kw={"height_ratios": [2, 1.5], "hspace": 0.08},
     )
     fig.suptitle(
-        f"{ticker} – Fractal Buy Signals  "
-        f"(D<{LOW_THRESH} → D>{HIGH_THRESH} → D<{LOW_THRESH} within {MAX_WEEKS_BETWEEN}w)",
-        fontsize=13, fontweight="bold",
+        f"{ticker} – Fractal Signals  "
+        f"(D<{LOW_THRESH} → D>{HIGH_THRESH} → D<{LOW_THRESH} within {MAX_WEEKS_BETWEEN}w)  |  "
+        f"▲ BUY (R>0)   ▼ SELL (R<0)",
+        fontsize=12, fontweight="bold",
     )
 
     # ── Panel 1: Price with signal markers ──
     ax1.plot(fractals.index, fractals["close"], color="steelblue",
              linewidth=1.1, label="Adj Close")
     if not signals.empty:
-        ax1.scatter(
-            signals.index, signals["close_at_signal"],
-            marker="^", color="limegreen", s=120, zorder=5,
-            label="Buy signal", edgecolors="darkgreen", linewidths=0.8,
-        )
+        buys  = signals[signals["signal"] == "BUY"]
+        sells = signals[signals["signal"] == "SELL"]
+        if not buys.empty:
+            ax1.scatter(buys.index, buys["close_at_signal"],
+                        marker="^", color="limegreen", s=130, zorder=5,
+                        label="BUY", edgecolors="darkgreen", linewidths=0.8)
+        if not sells.empty:
+            ax1.scatter(sells.index, sells["close_at_signal"],
+                        marker="v", color="tomato", s=130, zorder=5,
+                        label="SELL", edgecolors="darkred", linewidths=0.8)
     ax1.set_ylabel("Adj Close ($)")
     ax1.legend(fontsize=9)
     ax1.grid(True, alpha=0.3)
@@ -226,11 +240,16 @@ def plot_signals(
     ax2.axhline(1.5, color="grey", linestyle=":", linewidth=0.7, label="Random walk 1.5")
 
     if not signals.empty:
-        ax2.scatter(
-            signals.index, signals["D_at_signal"],
-            marker="^", color="limegreen", s=100, zorder=5,
-            edgecolors="darkgreen", linewidths=0.8,
-        )
+        buys  = signals[signals["signal"] == "BUY"]
+        sells = signals[signals["signal"] == "SELL"]
+        if not buys.empty:
+            ax2.scatter(buys.index, buys["D_at_signal"],
+                        marker="^", color="limegreen", s=100, zorder=5,
+                        edgecolors="darkgreen", linewidths=0.8)
+        if not sells.empty:
+            ax2.scatter(sells.index, sells["D_at_signal"],
+                        marker="v", color="tomato", s=100, zorder=5,
+                        edgecolors="darkred", linewidths=0.8)
 
     ax2.set_ylabel("Fractal Dimension D")
     ax2.set_xlabel("Date")
